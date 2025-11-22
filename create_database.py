@@ -1,6 +1,8 @@
 import os
 import glob
 import chromadb
+import json
+from db_connector import create_and_get_music_collection
 
 from songConverter import procesar_cancion_completa
 
@@ -12,10 +14,7 @@ COLLECTION_NAME = "fragmentos_musicales"
 
 client = chromadb.PersistentClient(path=DB_PATH)
 
-collection = client.get_or_create_collection(
-     name=COLLECTION_NAME,
-     metadata={"hnsw:space": "cosine"}
-)
+collection = create_and_get_music_collection()
 
 def poblar_base_de_datos():
         archivos_audio = glob.glob(os.path.join(CANCIONES_DIR, "*.mp3")) + glob.glob(os.path.join(CANCIONES_DIR, "*.wav"))
@@ -37,15 +36,20 @@ def poblar_base_de_datos():
                 if not fragmentos:
                     print(f"No se generaron vectores para '{nombre_cancion}'.")
                     continue
+                
+                valid_fragments = [f for f in fragmentos if f.get("vector_resumen") is not None]
+                if not valid_fragments:
+                    print(f"No se generaron vectores resumen válidos para '{nombre_cancion}'.")
+                    continue
 
-                ids = [f['id'] for f in fragmentos]
-                vectores = [f['vector'].tolist() for f in fragmentos]
-                metadatas = [f['metadata'] for f in fragmentos]
+                ids = [f['id'] for f in valid_fragments]
+                vectores_resumen = [f['vector_resumen'].tolist() for f in valid_fragments]
+                metadatas = [f['metadata'] for f in valid_fragments]
 
                 try:
                     collection.add(
                         ids=ids,
-                        embeddings=vectores,
+                        embeddings=vectores_resumen,
                         metadatas=metadatas
                     )
                     print(f"-> Se añadieron {len(ids)} fragmentos de {nombre_cancion} a la base de datos.")
