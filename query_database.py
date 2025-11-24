@@ -1,142 +1,96 @@
 import os
 import sys
+import time
 import json
 import numpy as np
 import sounddevice as sd
+import librosa
 from pydub import AudioSegment
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
-from dtaidistance import dtw
+
+# We use the Multi-Dimensional DTW now (12 dimensions for Chroma)
+from dtaidistance import dtw_ndim
+
 from db_connector import get_music_collection
-from songConverter import (
-    crear_contorno_melodico, 
-    crear_histograma_intervalos, 
-    extraer_linea_melodica_superior
-)
+from songConverter import generar_vector_chroma_cens
 
-DURACION = 10
-FILENAME = "query.mp3"
+# --- CONFIGURATION ---
+DURACION_GRABACION = 10
+ARCHIVO_QUERY = "query_actual.mp3"
 
-def grabar(duracion, salida):
-    print(f"\n>>> GRABANDO {duracion}s... (Acércate al micro y tararea FUERTE) <<<")
+def grabar_audio_correctamente(duracion, nombre_archivo):
+    # Standard recording logic with static fix
+    SAMPLE_RATE = 44100
+    print(f"\n--- PREPARANDO MICROFONO ({duracion}s) ---")
+    time.sleep(1)
+    print("3... 2... 1... CANTA!")
     
-    # 1. Record as float32
-    grabacion = sd.rec(int(duracion * 44100), samplerate=44100, channels=1, dtype='float32')
-    sd.wait()
-    
-    print(">>> PROCESANDO AUDIO... <<<")
-    
-    # 2. CRITICAL FIX: Remove the second dimension (Convert [[x],[x]] to [x,x])
-    grabacion = grabacion.flatten()
-    
-    # 3. Check volume (Is the mic working?)
-    max_val = np.max(np.abs(grabacion))
-    if max_val < 0.01:
-        print("⚠️ ADVERTENCIA: Audio muy bajo (casi silencio). Revisa tu configuración de micrófono en Windows.")
-        return None
-        
-    # 4. Normalize (Boost Volume to Max without clipping)
-    # This fixes "quiet humming" not being detected
-    grabacion = grabacion / (max_val + 1e-6)
-    
-    # 5. Convert to Int16 carefully
-    audio_int16 = (grabacion * 32767).astype(np.int16)
-    
-    # 6. Save
-    seg = AudioSegment(
-        audio_int16.tobytes(), 
-        frame_rate=44100, sample_width=2, channels=1
-    )
-    seg.export(salida, format="mp3")
-    print(f"Audio guardado en: {salida}")
-    return salida
-def procesar_query(ruta):
     try:
-        # Umbrales bajos para detectar tarareo suave
-        output, midi_data, _ = predict(ruta, ICASSP_2022_MODEL_PATH, onset_threshold=0.3, frame_threshold=0.2)
+        audio = sd.rec(int(duracion * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
+        sd.wait()
+        audio = audio.flatten() # Static fix
         
-        # Limpieza Skyline
-        midi_clean = extraer_linea_melodica_superior(midi_data)
+        if np.max(np.abs(audio)) < 0.01:
+            print("⚠️ Silencio detectado.")
+            return None
+            
+        audio = audio / (np.max(np.abs(audio)) + 1e-6)
         
-        # Extraer features usando la nueva lógica "Key-Invariant"
-        hist = crear_histograma_intervalos(midi_clean)
-        contorno = crear_contorno_melodico(midi_clean, fs=10)
-        
-        return hist, contorno
+        seg = AudioSegment((audio * 32767).astype(np.int16).tobytes(), frame_rate=SAMPLE_RATE, sample_width=2, channels=1)
+        seg.export(nombre_archivo, format="mp3")
+        return nombre_archivo
     except Exception as e:
-        print(f"Error procesando audio: {e}")
-        return None, None
+        print(e)
+        return None
 
-def buscar(ruta_audio):
+def buscar(ruta_query):
     col = get_music_collection()
     if not col: return
     
-    # 1. Extraer Features
-    hist_query, contorno_query = procesar_query(ruta_audio)
-    if not contorno_query:
-        print("No se pudo extraer melodía. Intenta cantar más claro y con notas 'Ta-Ta-Ta'.")
-        return
-
-    # 2. Filtrado Previo (Vector de Intervalos)
-    # Buscamos en DB canciones con estadísticas de intervalos similares
-    res = col.query(
-        query_embeddings=[hist_query],
-        n_results=50, # Traer top 50 candidatos
-        include=['metadatas']
-    )
+    # 1. Generate Chroma Vector for Hum
+    print(" -> Generando Chroma CENS del hum...")
+    q_chroma = generar_vector_chroma_cens(ruta_query)
     
-    # 3. Re-Ranking fino usando DTW sobre el Contorno
-    candidatos = res['metadatas'][0]
-    ids = res['ids'][0]
+    if q_chroma is None: return
+    
+    # Convert to Numpy for DTW
+    # Shape: (Time, 12)
+    q_seq = np.array(q_chroma, dtype=np.double)
+    
+    all_data = col.get()
     scores = []
     
-    q_seq = np.array(contorno_query, dtype=np.double)
+    print(f"Comparando contra {len(all_data['ids'])} fragmentos...")
     
-    print(f"\nComparando {len(candidatos)} candidatos con DTW...")
-    
-    for i, meta in enumerate(candidatos):
-        # Cargar contorno de la DB
+    for i, meta in enumerate(all_data['metadatas']):
         try:
-            c_seq = np.array(json.loads(meta['contorno_json']), dtype=np.double)
+            # 2. Load Target Sequence
+            t_seq = np.array(json.loads(meta['contorno_json']), dtype=np.double)
             
-            # Cálculo DTW (distancia de formas)
-            # Usamos dtw simple 1D ya que el contorno es una línea
-            d = dtw.distance(q_seq, c_seq)
+            if len(t_seq) < 10: continue
+
+            # 3. Multidimensional DTW
+            # Compares two matrices (TimeA x 12) vs (TimeB x 12)
+            d = dtw_ndim.distance(q_seq, t_seq)
             
-            # Normalizamos por la longitud para ser justos
-            score = d / (len(q_seq) + len(c_seq))
-            
-            scores.append({
-                "cancion": meta['cancion'],
-                "idx": meta['idx'],
-                "score": score
-            })
-        except: pass
+            # Normalize score
+            score = d / (len(q_seq) + len(t_seq))
+            scores.append((meta['cancion'], score))
+        except Exception as e: 
+            pass
         
-    # Ordenar (Menor score es mejor)
-    scores.sort(key=lambda x: x['score'])
+    scores.sort(key=lambda x: x[1])
     
-    print("\n=== RESULTADOS (MEJOR MATCH ARRIBA) ===")
+    print("\n=== TOP 5 ===")
     seen = set()
-    for s in scores:
-        if s['cancion'] not in seen:
-            print(f"Canción: {s['cancion']:<25} | Error: {s['score']:.4f}")
-            seen.add(s['cancion'])
-            if len(seen) >= 5: break
+    for name, s in scores:
+        if name not in seen:
+            print(f"{name:<20} | {s:.4f}")
+            seen.add(name)
+        if len(seen) >= 5: break
 
 if __name__ == "__main__":
-    # Check if an argument was provided (e.g., python query_database.py my_song.mp3)
     if len(sys.argv) > 1:
-        ruta = sys.argv[1]
-        print(f"Usando archivo existente: {ruta}")
-        
-        # Verify file exists
-        if not os.path.exists(ruta):
-            print("Error: El archivo no existe.")
-        else:
-            buscar(ruta)
+        if os.path.exists(sys.argv[1]): buscar(sys.argv[1])
     else:
-        # If no argument, record from microphone
-        ruta = grabar(DURACION, FILENAME)
-        if ruta:
-            buscar(ruta)
+        f = grabar_audio_correctamente(DURACION_GRABACION, ARCHIVO_QUERY)
+        if f: buscar(f)

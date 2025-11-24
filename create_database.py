@@ -1,62 +1,80 @@
 import os
 import glob
 import chromadb
-import shutil # Import needed for manual cleaning
-from db_connector import create_and_get_music_collection
-from songConverter import procesar_cancion_completa, OUTPUT_DIR_AUDIO, OUTPUT_DIR_MIDI
+import shutil
+import time
 
+print("--- [DEBUG] Importing modules... ---")
+from db_connector import create_and_get_music_collection
+from songConverter import procesar_cancion_completa
+
+# Configuration
 CANCIONES_DIR = "music"
 DB_PATH = "music_database"
+DIR_RESULTADOS = "resultados"
 
 def poblar_base_de_datos():
-    # --- FIX 1: Clean directories ONCE before the loop starts ---
-    print("--- Cleaning previous results ---")
-    if os.path.exists(OUTPUT_DIR_AUDIO):
-        shutil.rmtree(OUTPUT_DIR_AUDIO)
-    if os.path.exists(OUTPUT_DIR_MIDI):
-        shutil.rmtree(OUTPUT_DIR_MIDI)
-
-    # Re-create empty parent directories
-    os.makedirs(OUTPUT_DIR_AUDIO, exist_ok=True)
-    os.makedirs(OUTPUT_DIR_MIDI, exist_ok=True)
-
-    client = chromadb.PersistentClient(path=DB_PATH)
-    collection = create_and_get_music_collection()
+    print("--- [DEBUG] Starting DB population ---")
     
-    archivos_audio = glob.glob(os.path.join(CANCIONES_DIR, "*.mp3")) + glob.glob(os.path.join(CANCIONES_DIR, "*.wav"))
-    print(f"Found {len(archivos_audio)} songs.")
-
-    for ruta_cancion in archivos_audio:
-        nombre_cancion = os.path.basename(ruta_cancion)
-
-        # Check if exists in DB
-        existing = collection.get(where={"cancion": nombre_cancion}, limit=1)
-        if existing["ids"]:
-            print(f"Skipping '{nombre_cancion}' (Already in DB)")
-            continue
-
-        # --- FIX 2: Pass limpiar=False so we don't delete previous songs ---
-        fragmentos = procesar_cancion_completa(ruta_cancion, limpiar=False)
-
-        if not fragmentos: continue
-        
-        # Fix for the "AttributeError" you saw earlier
-        valid_fragments = [f for f in fragmentos if f.get("vector_resumen") is not None]
-        
-        if not valid_fragments: continue
-
-        ids = [f['id'] for f in valid_fragments]
-        # Handle numpy array vs list conversion safely
-        vectores = [f['vector_resumen'] if isinstance(f['vector_resumen'], list) else f['vector_resumen'].tolist() for f in valid_fragments]
-        metadatas = [f['metadata'] for f in valid_fragments]
-
+    # 1. Clean old files
+    if os.path.exists(DB_PATH):
+        print(f"--- [DEBUG] Deleting old database at {DB_PATH} ---")
         try:
-            collection.add(ids=ids, embeddings=vectores, metadatas=metadatas)
-            print(f" -> Added {len(ids)} fragments for {nombre_cancion}")
+            shutil.rmtree(DB_PATH)
         except Exception as e:
-            print(f"Error DB: {e}")
+            print(f"Warning: Could not delete old DB: {e}")
+
+    # Note: We DON'T delete 'resultados' anymore so you can see the Demucs output
+    
+    # 2. Init DB
+    print("--- [DEBUG] Connecting to ChromaDB... ---")
+    try:
+        client = chromadb.PersistentClient(path=DB_PATH)
+        collection = create_and_get_music_collection()
+    except Exception as e:
+        print(f"CRITICAL ERROR connecting to DB: {e}")
+        return
+
+    # 3. Find files
+    print(f"--- [DEBUG] Looking for songs in '{CANCIONES_DIR}'... ---")
+    if not os.path.exists(CANCIONES_DIR):
+        print(f"CRITICAL ERROR: The folder '{CANCIONES_DIR}' does not exist!")
+        print(f"Please create a folder named '{CANCIONES_DIR}' next to this script and put MP3s inside.")
+        return
+
+    archivos = glob.glob(os.path.join(CANCIONES_DIR, "*.mp3")) + glob.glob(os.path.join(CANCIONES_DIR, "*.wav"))
+    
+    if len(archivos) == 0:
+        print(f"CRITICAL ERROR: Found 0 files in '{CANCIONES_DIR}'.")
+        print("Make sure files end in .mp3 or .wav")
+        return
+
+    print(f"--- [DEBUG] Found {len(archivos)} songs. Processing begins now... ---")
+
+    for i, ruta in enumerate(archivos):
+        print(f"\n[{i+1}/{len(archivos)}] Starting process for: {os.path.basename(ruta)}")
+        start_time = time.time()
         
-    print("Done.")
+        try:
+            # Call the GPU Heavy function
+            fragmentos = procesar_cancion_completa(ruta, limpiar=False)
+            
+            if fragmentos:
+                ids = [f['id'] for f in fragmentos]
+                metadatas = [f['metadata'] for f in fragmentos]
+                embeddings = [f['vector_resumen'] for f in fragmentos]
+                
+                print(f"   -> Saving {len(ids)} fragments to DB...")
+                collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
+                print(f"   -> Done in {time.time() - start_time:.2f}s")
+            else:
+                print("   -> Warning: No fragments generated (Audio too short or silent?)")
+                
+        except Exception as e:
+            print(f"   -> ERROR processing song: {e}")
+
+    print("\n--- [DEBUG] Database Population Finished! ---")
+    print(f"Total entries in DB: {collection.count()}")
 
 if __name__ == "__main__":
-     poblar_base_de_datos()
+    poblar_base_de_datos()
